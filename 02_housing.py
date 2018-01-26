@@ -36,11 +36,9 @@ def fetch_housing_data(housing_url=HOUSING_URL, housing_path=HOUSING_PATH):
 
 def load_housing_data(housing_path=HOUSING_PATH):
     csv_path = os.path.join(housing_path, "housing.csv")
+    if not os.path.exists(csv_path):
+        fetch_housing_data()
     return pd.read_csv(csv_path)
-
-
-fetch_housing_data()
-housing = load_housing_data()
 
 
 def bird_view(df):
@@ -52,26 +50,26 @@ def bird_view(df):
     missing_percent
 
 
-# bird_view(housing)
-
 # 3  Discover and visualize the data to gain insights
 # omit
+def insight(housing):
+    housing["rooms_per_household"] = housing["total_rooms"] / housing["households"]
+    housing["bedrooms_per_room"] = housing["total_bedrooms"] / housing[
+        "total_rooms"]
+    housing["population_per_household"] = housing["population"] / housing[
+        "households"]
 
-housing["rooms_per_household"] = housing["total_rooms"] / housing["households"]
-housing["bedrooms_per_room"] = housing["total_bedrooms"] / housing[
-    "total_rooms"]
-housing["population_per_household"] = housing["population"] / housing[
-    "households"]
-
-corr_matrix = housing.corr()
-print ('correlation with y:', corr_matrix["median_house_value"].sort_values(ascending=False))
+    corr_matrix = housing.corr()
+    print(
+        'correlation with y:',
+        corr_matrix["median_house_value"].sort_values(ascending=False))
 
 # Hey, not bad! The new bedrooms_per_room attribute is much more correlated with the median house value
 # than the total number of rooms or bedrooms. Apparently houses with a lower bedroom/room ratio tend to
 # be more expensive.
 
 
-def split_train_test():
+def split_train_test(housing):
     # split train/test by stratified sampling
     # make sure train/test as same distribution of a feature
     housing["income_cat"] = np.ceil(housing["median_income"] / 1.5)
@@ -83,18 +81,6 @@ def split_train_test():
     for set_ in (strat_train_set, strat_test_set):
         set_.drop("income_cat", axis=1, inplace=True)
     return strat_train_set, strat_test_set
-
-
-strat_train_set, strat_test_set = split_train_test()
-
-X_train = strat_train_set.drop(
-    "median_house_value", axis=1)  # drop labels for training set
-y_train = strat_train_set["median_house_value"].copy()
-
-# use pipeline
-housing_num = X_train.drop("ocean_proximity", axis=1)
-num_attribs = list(housing_num)
-cat_attribs = ["ocean_proximity"]
 
 
 # To use pipeline, create a class to select numerical or categorical columns
@@ -114,6 +100,7 @@ class DataFrameSelector(BaseEstimator, TransformerMixin):
 rooms_ix, bedrooms_ix, population_ix, household_ix = 3, 4, 5, 6
 
 
+# combine features
 class CombinedAttributesAdder(BaseEstimator, TransformerMixin):
     def __init__(self, add_bedrooms_per_room=True):  # no *args or **kargs
         self.add_bedrooms_per_room = add_bedrooms_per_room
@@ -132,28 +119,28 @@ class CombinedAttributesAdder(BaseEstimator, TransformerMixin):
             return np.c_[X, rooms_per_household, population_per_household]
 
 
-num_pipeline = Pipeline([
-    ('selector', DataFrameSelector(num_attribs)),
-    ('imputer', Imputer(strategy="median")),
-    ('attribs_adder', CombinedAttributesAdder()),
-    ('std_scaler', StandardScaler()),
-])
+def make_pipline(X_train):
+    housing_num = X_train.drop("ocean_proximity", axis=1)
+    num_attribs = list(housing_num)
+    cat_attribs = ["ocean_proximity"]
 
-cat_pipeline = Pipeline([
-    ('selector', DataFrameSelector(cat_attribs)),
-    ('cat_encoder', CategoricalEncoder(encoding="onehot-dense")),
-])
+    num_pipeline = Pipeline([
+        ('selector', DataFrameSelector(num_attribs)),
+        ('imputer', Imputer(strategy="median")),
+        ('attribs_adder', CombinedAttributesAdder()),
+        ('std_scaler', StandardScaler()),
+    ])
 
-full_pipeline = FeatureUnion(transformer_list=[
-    ("num_pipeline", num_pipeline),
-    ("cat_pipeline", cat_pipeline),
-])
+    cat_pipeline = Pipeline([
+        ('selector', DataFrameSelector(cat_attribs)),
+        ('cat_encoder', CategoricalEncoder(encoding="onehot-dense")),
+    ])
 
-housing_prepared = full_pipeline.fit_transform(X_train)
-
-# 5  Select and train a model
-lin_reg = LinearRegression()
-lin_reg.fit(housing_prepared, y_train)
+    full_pipeline = FeatureUnion(transformer_list=[
+        ("num_pipeline", num_pipeline),
+        ("cat_pipeline", cat_pipeline),
+    ])
+    return full_pipeline
 
 
 # 5.1  Select a Performance Measure
@@ -169,29 +156,22 @@ def rmse_cv(model, X, y):
     return np.sqrt(-scores)
 
 
-def valid_train(model):
-    scores = rmse_cv(model, housing_prepared, y_train)
+def validate(model, X_train, y_train):
+    scores = rmse_cv(model, X_train, y_train)
     print("Mean:", scores.mean())
     print("Standard deviation:", scores.std())
 
 
-valid_train(lin_reg)
-
-
 # Evaluate Your System on the Test Set
-def eval_test(model):
-    X_test = strat_test_set.drop("median_house_value", axis=1)
-    y_test = strat_test_set["median_house_value"].copy()
+def eval_test(model, test_set, full_pipeline):
+    X_test = test_set.drop("median_house_value", axis=1)
+    y_test = test_set["median_house_value"].copy()
     X_test_prepared = full_pipeline.transform(X_test)
     y_pred = model.predict(X_test_prepared)
     return RMSE(y_test, y_pred)
 
 
-print('test_score:', eval_test(lin_reg))
-
-
-# 6.0.1  Grid Search
-def RF_grid_search():
+def RF_grid_search(X_train, y_train):
     from sklearn.model_selection import GridSearchCV
     from sklearn.ensemble import RandomForestRegressor
     forest_reg = RandomForestRegressor(random_state=42)
@@ -210,10 +190,33 @@ def RF_grid_search():
     ]
     grid_search = GridSearchCV(
         forest_reg, param_grid, cv=5, scoring='neg_mean_squared_error')
-    grid_search.fit(housing_prepared, y_train)
+    grid_search.fit(X_train, y_train)
     return grid_search
     # train across 5 folds, that's a total of (12+6)*5=90 rounds of training
 
 
-# grid_search = RF_grid_search()
-# final_model = grid_search.best_estimator_
+def main():
+    housing = load_housing_data()
+    # bird_view(housing)
+    strat_train_set, strat_test_set = split_train_test(housing)
+
+    X_train = strat_train_set.drop(
+        "median_house_value", axis=1)  # drop labels for training set
+    y_train = strat_train_set["median_house_value"].copy()
+
+    full_pipeline = make_pipline(X_train)
+    X_train_prep = full_pipeline.fit_transform(X_train)
+
+    # Select and train a model
+    lin_reg = LinearRegression()
+    lin_reg.fit(X_train_prep, y_train)
+    validate(lin_reg, X_train_prep, y_train)
+
+    print('test_score:', eval_test(lin_reg, strat_test_set, full_pipeline))
+
+    # grid_search = RF_grid_search(X_train_prep, y_train)
+    # final_model = grid_search.best_estimator_
+
+
+if __name__ == "__main__":
+    main()
